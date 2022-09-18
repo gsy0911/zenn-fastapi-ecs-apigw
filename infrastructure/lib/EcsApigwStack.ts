@@ -6,9 +6,42 @@ import {
   aws_logs,
   aws_ecr,
   aws_iam,
+  aws_servicediscovery,
 } from 'aws-cdk-lib';
 import {Construct} from 'constructs';
 import {prefix} from './common';
+import {VpcLink, HttpApi} from '@aws-cdk/aws-apigatewayv2-alpha';
+import {HttpServiceDiscoveryIntegration} from '@aws-cdk/aws-apigatewayv2-integrations-alpha';
+
+export class VpcStack extends Stack {
+  constructor(scope: Construct, id: string, props?: StackProps) {
+    super(scope, id, props);
+
+    new aws_ec2.Vpc(this, "vpc", {
+      cidr: "10.0.0.0/16",
+      maxAzs: 1,
+      subnetConfiguration: [
+        {
+          subnetType: aws_ec2.SubnetType.PUBLIC,
+          name: "public",
+          cidrMask: 24
+        },
+        {
+          subnetType: aws_ec2.SubnetType.PRIVATE_WITH_EGRESS,
+          name: "private",
+          cidrMask: 24,
+
+        },
+        {
+          subnetType: aws_ec2.SubnetType.PRIVATE_ISOLATED,
+          name: "isolated",
+          cidrMask: 28
+        }
+      ],
+      natGateways: 0
+    })
+  }
+}
 
 
 export interface IEcsStack {
@@ -111,5 +144,35 @@ export class EcsStack extends Stack {
       ],
       enableExecuteCommand: true
     })
+  }
+}
+
+export interface IApigwStack {
+  vpcId: `vpc-${string}`
+  namespace: string
+}
+
+export class ApigwStack extends Stack {
+  constructor(scope: Construct, id: string, params: IApigwStack, props?: StackProps) {
+    super(scope, id, props);
+
+    const vpc = aws_ec2.Vpc.fromLookup(this, "vpc", {
+      vpcId: params.vpcId
+    })
+    const vpcLink = new VpcLink(this, "vpclink", {
+      vpcLinkName: `${prefix}-vpclink`,
+      vpc
+    })
+    const namespace = new aws_servicediscovery.PrivateDnsNamespace(this, 'Namespace', {
+      name: params.namespace,
+      vpc
+    });
+
+    const service = namespace.createService('service');
+    new HttpApi(this, 'HttpProxyPrivateApi', {
+      defaultIntegration: new HttpServiceDiscoveryIntegration('DefaultIntegration', service, {
+        vpcLink,
+      }),
+    });
   }
 }
