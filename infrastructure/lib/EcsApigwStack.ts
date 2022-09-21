@@ -1,6 +1,9 @@
 import {
+  App,
+  Duration,
   Stack,
   StackProps,
+  aws_ssm,
   aws_ec2,
   aws_ecs,
   aws_logs,
@@ -8,16 +11,23 @@ import {
   aws_iam,
   aws_servicediscovery,
 } from 'aws-cdk-lib';
-import {Construct} from 'constructs';
 import {prefix} from './common';
 import {VpcLink, HttpApi} from '@aws-cdk/aws-apigatewayv2-alpha';
 import {HttpServiceDiscoveryIntegration} from '@aws-cdk/aws-apigatewayv2-integrations-alpha';
 
+const ssmVpcId = `/cdk/${prefix}/vpc/id`
+const ssmNamespaceName = `/cdk/${prefix}/cloudmap/namespace/name`
+const ssmNamespaceArn = `/cdk/${prefix}/cloudmap/namespace/arn`
+const ssmNamespaceId = `/cdk/${prefix}/cloudmap/namespace/id`
+const ssmServiceName = `/cdk/${prefix}/cloudmap/service/name`
+const ssmServiceArn = `/cdk/${prefix}/cloudmap/service/arn`
+const ssmServiceId = `/cdk/${prefix}/cloudmap/service/id`
+
 export class VpcStack extends Stack {
-  constructor(scope: Construct, id: string, props?: StackProps) {
+  constructor(scope: App, id: string, props?: StackProps) {
     super(scope, id, props);
 
-    new aws_ec2.Vpc(this, "vpc", {
+    const vpc = new aws_ec2.Vpc(this, "vpc", {
       cidr: "10.0.0.0/16",
       maxAzs: 1,
       subnetConfiguration: [
@@ -40,12 +50,16 @@ export class VpcStack extends Stack {
       ],
       natGateways: 0
     })
+
+    new aws_ssm.StringParameter(this, 'ssmParameter', {
+      parameterName: ssmVpcId,
+      stringValue: vpc.vpcId,
+    });
   }
 }
 
 
 export interface IEcsStack {
-  vpcId: `vpc-${string}`
   ecr: {
     fastapi: {
       name: string
@@ -55,23 +69,27 @@ export interface IEcsStack {
   ecs: {
     taskMemoryLimit: number
     taskCpu: number
+    cloudMapNamespace: string
   }
 }
 
 export class EcsStack extends Stack {
-  constructor(scope: Construct, id: string, params: IEcsStack, props?: StackProps) {
+  constructor(scope: App, id: string, params: IEcsStack, props?: StackProps) {
     super(scope, id, props);
 
-    const accountId = Stack.of(this).account;
-    const region = Stack.of(this).region;
+    const accountId = Stack.of(this).account
+    const region = Stack.of(this).region
     const vpc = aws_ec2.Vpc.fromLookup(this, "vpc", {
-      vpcId: params.vpcId
+      vpcId: aws_ssm.StringParameter.valueFromLookup(this, ssmVpcId)
     })
 
     const cluster = new aws_ecs.Cluster(this, 'fargate-cluster', {
       vpc: vpc,
       clusterName: `${prefix}-cluster`,
       enableFargateCapacityProviders: true,
+      defaultCloudMapNamespace: {
+        name: params.ecs.cloudMapNamespace
+      }
     });
 
     // create a task definition with CloudWatch Logs
@@ -119,7 +137,7 @@ export class EcsStack extends Stack {
       taskRole: taskRole,
     })
 
-    taskFargate.addContainer("ecs-task-fastapi", {
+    const taskContainer = taskFargate.addContainer("ecs-task-fastapi", {
       containerName: "fastapi",
       image: containerImageBackend,
       portMappings: [
@@ -131,7 +149,7 @@ export class EcsStack extends Stack {
       logging,
     })
 
-    new aws_ecs.FargateService(this, "ecs-service", {
+    const fargateService = new aws_ecs.FargateService(this, "ecs-service", {
       serviceName: `${prefix}-service`,
       cluster,
       taskDefinition: taskFargate,
@@ -142,34 +160,70 @@ export class EcsStack extends Stack {
           weight: 1
         }
       ],
-      enableExecuteCommand: true
+      enableExecuteCommand: true,
+      cloudMapOptions: {
+        name: "fargate-service-discovery",
+        dnsRecordType: aws_servicediscovery.DnsRecordType.SRV,
+        container: taskContainer,
+        containerPort: 80,
+        dnsTtl: Duration.seconds(30),
+      }
     })
+
+    new aws_ssm.StringParameter(this, 'ssmServiceId', {
+      parameterName: ssmServiceId,
+      stringValue: fargateService.cloudMapService?.serviceId || "",
+    });
+    new aws_ssm.StringParameter(this, 'ssmServiceName', {
+      parameterName: ssmServiceName,
+      stringValue: fargateService.cloudMapService?.serviceName || "",
+    });
+    new aws_ssm.StringParameter(this, 'ssmServiceArn', {
+      parameterName: ssmServiceArn,
+      stringValue: fargateService.cloudMapService?.serviceArn || "",
+    });
+    new aws_ssm.StringParameter(this, 'ssmNamespaceId', {
+      parameterName: ssmNamespaceId,
+      stringValue: fargateService.cloudMapService?.namespace.namespaceId || "",
+    });
+    new aws_ssm.StringParameter(this, 'ssmNamespaceName', {
+      parameterName: ssmNamespaceName,
+      stringValue: fargateService.cloudMapService?.namespace.namespaceName || "",
+    });
+    new aws_ssm.StringParameter(this, 'ssmNamespaceArn', {
+      parameterName: ssmNamespaceArn,
+      stringValue: fargateService.cloudMapService?.namespace.namespaceArn || "",
+    });
   }
 }
 
-export interface IApigwStack {
-  vpcId: `vpc-${string}`
-  namespace: string
-}
-
 export class ApigwStack extends Stack {
-  constructor(scope: Construct, id: string, params: IApigwStack, props?: StackProps) {
+  constructor(scope: App, id: string, props?: StackProps) {
     super(scope, id, props);
 
     const vpc = aws_ec2.Vpc.fromLookup(this, "vpc", {
-      vpcId: params.vpcId
+      vpcId: aws_ssm.StringParameter.valueFromLookup(this, ssmVpcId)
     })
     const vpcLink = new VpcLink(this, "vpclink", {
       vpcLinkName: `${prefix}-vpclink`,
       vpc
     })
-    const namespace = new aws_servicediscovery.PrivateDnsNamespace(this, 'Namespace', {
-      name: params.namespace,
-      vpc
-    });
-
-    const service = namespace.createService('service');
-    new HttpApi(this, 'HttpProxyPrivateApi', {
+    const namespace = aws_servicediscovery.PrivateDnsNamespace.fromPrivateDnsNamespaceAttributes(this, "ecs-namespace", {
+      namespaceArn: aws_ssm.StringParameter.valueFromLookup(this, ssmNamespaceArn),
+      namespaceId: aws_ssm.StringParameter.valueFromLookup(this, ssmNamespaceId),
+      namespaceName: aws_ssm.StringParameter.valueFromLookup(this, ssmNamespaceName),
+    })
+    const service = aws_servicediscovery.Service.fromServiceAttributes(this, "ecs-service", {
+      dnsRecordType: aws_servicediscovery.DnsRecordType.A,
+      namespace,
+      routingPolicy: aws_servicediscovery.RoutingPolicy.WEIGHTED,
+      serviceName: aws_ssm.StringParameter.valueFromLookup(this, ssmServiceName),
+      serviceId: aws_ssm.StringParameter.valueFromLookup(this, ssmServiceId),
+      serviceArn: aws_ssm.StringParameter.valueFromLookup(this, ssmServiceArn),
+    })
+    new HttpApi(this, 'private-api', {
+      apiName: `${prefix}-private-api`,
+      description: `connect ECS via CloudMap`,
       defaultIntegration: new HttpServiceDiscoveryIntegration('DefaultIntegration', service, {
         vpcLink,
       }),
