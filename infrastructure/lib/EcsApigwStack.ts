@@ -22,6 +22,7 @@ const ssmNamespaceId = `/cdk/${prefix}/cloudmap/namespace/id`
 const ssmServiceName = `/cdk/${prefix}/cloudmap/service/name`
 const ssmServiceArn = `/cdk/${prefix}/cloudmap/service/arn`
 const ssmServiceId = `/cdk/${prefix}/cloudmap/service/id`
+const ssmEcsSg = `/cdk/${prefix}/ecs/security-group/id`
 
 export class VpcStack extends Stack {
   constructor(scope: App, id: string, props?: StackProps) {
@@ -48,7 +49,6 @@ export class VpcStack extends Stack {
           cidrMask: 28
         }
       ],
-      natGateways: 0
     })
 
     new aws_ssm.StringParameter(this, 'ssmParameter', {
@@ -149,11 +149,16 @@ export class EcsStack extends Stack {
       logging,
     })
 
+    // SecurityGroup
+    const securityGroupEcs = new aws_ec2.SecurityGroup(this, "sg-ecs", {
+      vpc: vpc,
+      securityGroupName: `${prefix}-ecs-sg`,
+    })
     const fargateService = new aws_ecs.FargateService(this, "ecs-service", {
       serviceName: `${prefix}-service`,
       cluster,
       taskDefinition: taskFargate,
-      assignPublicIp: true,
+      securityGroups: [securityGroupEcs],
       capacityProviderStrategies: [
         {
           capacityProvider: "FARGATE_SPOT",
@@ -194,6 +199,10 @@ export class EcsStack extends Stack {
       parameterName: ssmNamespaceArn,
       stringValue: fargateService.cloudMapService?.namespace.namespaceArn || "",
     });
+    new aws_ssm.StringParameter(this, 'ssmEcsSg', {
+      parameterName: ssmEcsSg,
+      stringValue: securityGroupEcs.securityGroupId,
+    });
   }
 }
 
@@ -204,10 +213,20 @@ export class ApigwStack extends Stack {
     const vpc = aws_ec2.Vpc.fromLookup(this, "vpc", {
       vpcId: aws_ssm.StringParameter.valueFromLookup(this, ssmVpcId)
     })
+    const securityGroupVpcLink = new aws_ec2.SecurityGroup(this, "sg-vpclink", {
+      vpc: vpc,
+      securityGroupName: `${prefix}-vpclink-sg`,
+    })
     const vpcLink = new VpcLink(this, "vpclink", {
       vpcLinkName: `${prefix}-vpclink`,
-      vpc
+      vpc,
+      securityGroups: [securityGroupVpcLink]
     })
+    // ECS security group
+    const securityGroupEcsId = aws_ssm.StringParameter.valueFromLookup(this, ssmEcsSg)
+    const securityGroupSrcEcs = aws_ec2.SecurityGroup.fromSecurityGroupId(this, "sg-ecs", securityGroupEcsId)
+    securityGroupSrcEcs.addIngressRule(securityGroupVpcLink, aws_ec2.Port.allTcp(), "allow ingress from ECS Service")
+
     const namespace = aws_servicediscovery.PrivateDnsNamespace.fromPrivateDnsNamespaceAttributes(this, "ecs-namespace", {
       namespaceArn: aws_ssm.StringParameter.valueFromLookup(this, ssmNamespaceArn),
       namespaceId: aws_ssm.StringParameter.valueFromLookup(this, ssmNamespaceId),
